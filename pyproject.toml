@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dengue-forecast"
+version = "0.1.0"
+description = "Multi-source spatio-temporal dengue outbreak prediction using explainable deep learning"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "pyarrow>=14.0",     # Parquet engine for src/io.py and src/artifacts.py
+    "pyyaml>=6.0",
+    "scikit-learn>=1.4", # scaling and the gradient-boosting baseline
+]
+
+[project.optional-dependencies]
+# Kept out of the core install so Phase 0-3 does not pull a TensorFlow build.
+model = [
+    "tensorflow>=2.15",
+    "shap>=0.45",
+]
+dashboard = [
+    "streamlit>=1.30",
+    "plotly>=5.18",   # interactive screen charts
+    "matplotlib>=3.8",  # PNG/PDF export and the report figures
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.9",
+]
+
+[tool.setuptools]
+# `scripts` is deliberately absent: those are entry points to be run, not
+# imported. Nothing imports one, and an editable install that made them
+# importable would invite putting shared code back into a CLI file.
+packages = ["src", "src.models", "src.sources", "dashboard"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: needs the frozen production artifact and runs the real model",
+    "e2e: starts a Streamlit server and drives a real browser",
+]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "D"]
+# D105/D107: __post_init__ and __init_subclass__ are validation hooks whose
+# purpose is evident from the class docstring above them.
+ignore = ["D203", "D213", "D105", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test names are the documentation; a docstring on every one is noise. Long
+# lines in tests are usually a data literal, which reads worse when wrapped.
+"tests/*" = ["D100", "D103", "E501"]
+# E402: a notebook has to run `sys.path.insert(0, "..")` before it can import
+# `src`, so the imports genuinely cannot come first. E702: a trailing semicolon
+# suppressing a cell's repr is the notebook idiom, not a second statement.
+"notebooks/*.ipynb" = ["E402", "E702"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = false
+disallow_untyped_defs = true
+ignore_missing_imports = true

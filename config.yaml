@@ -1,0 +1,263 @@
+# Every tunable in the project lives here. Nothing downstream hard-codes a value.
+# Loaded once by src/config.py into a frozen, validated Config tree.
+#
+# Unknown or missing keys are a startup error, not a silent default — if you add a
+# key here you must add the matching field in src/config.py.
+
+project:
+  name: dengue-forecast
+  seed: 42
+  # monthly | weekly. Drives seasonal_period (12 or 52).
+  # OPEN: brain.md Q-01 — confirm actual case-data granularity before Phase 2.
+  granularity: monthly
+
+paths:
+  # Relative paths resolve against the directory holding this file.
+  data_raw: data/raw
+  data_interim: data/interim
+  data_processed: data/processed
+  results: results
+  runs: results/runs
+  figures: results/figures
+  metrics: results/metrics
+
+data:
+  # Sources to FETCH. Distinct from features.sources, which selects the subset
+  # that feeds the model. The target always needs cases and population, so the
+  # climate-only ablation must still load them — it just does not use them as
+  # inputs. Fetching and ablating are different decisions.
+  sources: [climate, cases, demographic, awareness]
+  start_date: 2010-01-01
+  end_date: 2023-12-31
+  # OPEN: brain.md Q-05 — confirm state list and year range.
+  states:
+    - Delhi
+    - Gujarat
+    - Karnataka
+    - Kerala
+    - Madhya Pradesh
+    - Maharashtra
+    - Odisha
+    - Punjab
+    - Rajasthan
+    - Tamil Nadu
+    - Uttar Pradesh
+    - West Bengal
+  target_column: cases
+  # log1p | none. brain.md D-02: target is log(cases_per_100k + 1).
+  target_transform: log1p
+  population_normalisation: 100000
+
+features:
+  # Ablation A/B/C is expressed by narrowing this list. Must be a subset of
+  # data.sources; variables from unselected sources are dropped as model inputs.
+  sources: [climate, cases, demographic, awareness]
+
+  # Ablation D/E and F: with or without lag features, with or without spatial.
+  include_lags: true
+  include_spatial: true
+  # Autoregressive terms on the target's own scale. The naive baselines read
+  # their prediction straight out of these, so turning this off disables them.
+  include_target_lags: true
+  # One-hot state columns, routed to the dense layer as a learned embedding by the
+  # LSTM and usable as an ordinary categorical by the tree baselines.
+  include_state_identity: true
+
+  # Included at their value at t. Note 'population' is deliberately absent: it is
+  # the target's denominator, not a driver, and would otherwise enter twice.
+  level_variables: [cases, rainfall, temperature, humidity, search_interest]
+
+  # brain.md A-2c: this list MUST contain project.seasonal_period, otherwise
+  # seasonal-naive cannot read its own input from X and falls out of the protocol.
+  lags: [1, 2, 3, 4, 5, 6, 12]
+  # Adding a variable here is all it takes to lag it — no code change.
+  lag_variables: [cases, rainfall, temperature, humidity, search_interest]
+
+  rolling_windows: [3, 6]
+  rolling_variables: [rainfall, temperature, humidity]
+  rolling_aggs: [mean]
+
+  spatial_lags: [1, 2]
+  spatial_variable: cases
+  # uniform | population. See src/features.py on why uniform is the default.
+  spatial_weight_scheme: uniform
+
+  # Broadcast per state, never lagged.
+  static_variables: [population_density]
+
+  sequence_length: 12
+  cyclic_seasonality: true
+
+model:
+  lstm:
+    # brain.md D-14: small network. The reference paper's 1000 units would memorise this dataset.
+    units: 48
+    # One or two only. The reference paper's 1000 units on far more data would
+    # memorise this dataset outright.
+    layers: 2
+    dropout: 0.2
+    recurrent_dropout: 0.0
+    learning_rate: 0.001
+    batch_size: 32
+    max_epochs: 100
+    early_stopping_patience: 10
+    # OPEN: brain.md Q-09 — validation carved from the tail of the train fold, time-ordered.
+    validation_fraction: 0.15
+    state_embedding_dim: 4
+  gbm:
+    n_estimators: 400
+    max_depth: 3
+    learning_rate: 0.05
+  ridge:
+    # RidgeCV picks among these using the training fold only.
+    alphas: [0.01, 0.1, 1.0, 10.0, 100.0]
+
+split:
+  # brain.md D-03/D-04: time-ordered rolling origin only. Never shuffle.
+  scheme: rolling_origin
+  n_folds: 4
+  # Must fit the LONGEST horizon, not the shortest: a 3-period horizon costs two
+  # more usable origins than a 1-period one (target shift plus embargo), and the
+  # geometry check rejects the whole grid if the last fold does not fit.
+  initial_train_size: 90
+  test_size: 12
+  step: 12
+
+forecast:
+  # brain.md C-3 / README §15.6: 1-month and 3-month lead time.
+  horizons: [1, 3]
+  # How far past the trained horizon forward projection will go before refusing.
+  # Each recursive step feeds the previous prediction back as an input, so error
+  # compounds; six periods is already a weak claim and the reliability flag says so.
+  max_recursive_steps: 6
+
+conformal:
+  # brain.md S-2/D-16. alpha 0.2 -> 80% interval, matching README §9's output format.
+  alpha: 0.2
+  # Floor, not a window. The rolling window is the fold's validation block, which
+  # already slides forward. Truncating to the last N rows would calibrate on one
+  # state only, because rows are ordered state-major.
+  min_calibration_residuals: 20
+
+risk:
+  # brain.md D-10: thresholds are DERIVED FROM DATA, never hand-picked.
+  # quantile: per-state quantiles of that state's own historical case rate.
+  # ewma:     exponentially weighted moving average plus k standard deviations,
+  #           the classic outbreak-detection form.
+  method: quantile
+  quantiles: [0.75, 0.90]
+  tiers: [LOW, MEDIUM, HIGH]
+  # brain.md D-11: alerts fire on the interval upper bound, not the point forecast.
+  # For preparedness the relevant question is the plausible worst case.
+  alert_on: upper
+  # Used only when method is ewma.
+  ewma_alpha: 0.3
+  ewma_sigma: 2.0
+
+  # THE ACTION CATALOGUE. This is the part a domain expert revises, and it is here
+  # rather than in code so they can do it without a developer.
+  #
+  # OPEN (brain.md Q-07): these are placeholders phrased from standard vector-control
+  # practice. Before submission they should be replaced with wording cited from
+  # NVBDCP or WHO guidance, and action_source updated to name the document. An
+  # examiner asking "who says these are the right actions?" is the likeliest
+  # question at this component, and a citation is the only good answer.
+  action_source: "PLACEHOLDER - not yet cited to NVBDCP or WHO guidance"
+  actions:
+    - tier: LOW
+      actions:
+        - Continue routine surveillance and weekly reporting
+        - Maintain baseline vector-control activity
+    - tier: MEDIUM
+      actions:
+        - Intensify larval source reduction in affected blocks
+        - Brief primary health centres on case definitions and reporting
+        - Verify diagnostic kit and insecticide stocks
+    - tier: HIGH
+      actions:
+        - Launch a source-reduction drive in affected districts
+        - Pre-position hospital beds and IV fluids
+        - Targeted public-awareness messaging in affected areas
+        - Daily case reporting until the alert clears
+
+simulate:
+  # brain.md D-09: clamp scenario inputs to a plausible range and warn outside it.
+  clamp_strategy: sigma
+  clamp_n_sigma: 2.0
+
+explain:
+  # brain.md S-5: KernelExplainer over a wrapped LSTM. Keep these small; it is slow.
+  # kernel | gradient. Kernel is version-proof but slow; gradient is far faster and
+  # kept behind this switch for builds where it works on recurrent layers.
+  explainer: kernel
+  background_samples: 50
+  nsamples: 200
+  top_k_features: 5
+  # Cost bound. KernelExplainer is O(rows x nsamples x features); explaining every
+  # row of a full panel would take hours for no extra insight.
+  max_explained_rows: 60
+
+quality:
+  # Median/MAD rule, not mean/std: an outbreak inflates the standard deviation
+  # enough to hide itself from a z-score.
+  outlier_mad_threshold: 5.0
+  # A state averaging below this coverage is reported as unusable.
+  min_coverage: 0.8
+  # Below this many periods per state, a per-state LSTM cannot be fitted and the
+  # pooled model of brain.md S-1 stops being a choice.
+  min_periods_for_per_state_model: 80
+
+preprocess:
+  # Only climate is interpolated. Case counts are never invented: a missing month
+  # of surveillance is information, and filling it fabricates an epidemic curve.
+  interpolate_variables: [rainfall, temperature, humidity]
+  interpolation_method: linear
+  # Gaps longer than this are left missing and flagged, not filled.
+  max_interpolation_gap: 2
+
+production:
+  # The primary model is fixed by the project brief, so selection chooses the best
+  # CONFIGURATION for this model, not the best model overall. If a baseline beats
+  # it, that belongs in the report rather than in the frozen artifact.
+  model: lstm
+  selection_metric: mae_cases_per_100k
+  # When configurations are within one fold standard deviation of the best, prefer
+  # the one with fewest features. A 72-feature win that is statistically
+  # indistinguishable from a 29-feature configuration is not a win.
+  parsimony_tiebreak: true
+  # Periods held back from the final fit to calibrate conformal intervals. Without
+  # this the intervals would be calibrated on data the model has already seen, and
+  # would be far too narrow to alert on.
+  calibration_periods: 12
+
+# The ablation grid. One entry per named configuration; anything omitted is
+# inherited from the sections above. This list IS the experiment plan, so adding a
+# configuration is an edit here, never a new script.
+experiments:
+  # A/B/C: does combining heterogeneous sources beat single-source input? (RQ1)
+  - name: A_climate_only
+    sources: [climate]
+    include_spatial: false
+    note: Climate drivers alone. No case history at all, so the naive baselines cannot run.
+  - name: B_climate_cases
+    sources: [climate, cases]
+    include_spatial: false
+    note: Climate plus the epidemiological history.
+  - name: C_full_multisource
+    sources: [climate, cases, demographic, awareness]
+    include_spatial: false
+    note: Every source, temporal features only.
+
+  # D/E/F: which feature designs earn their place? (RQ2)
+  - name: D_without_lags
+    include_lags: false
+    include_spatial: false
+    note: Levels only. Tests whether explicit lag windows add anything over the sequence.
+  - name: E_with_lags
+    include_lags: true
+    include_spatial: false
+    note: Lags and rolling aggregates, no spatial terms.
+  - name: F_lags_and_spatial
+    include_lags: true
+    include_spatial: true
+    note: Adds neighbouring states' lagged cases. Expected to hurt sparsely-connected states.

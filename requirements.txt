@@ -1,0 +1,31 @@
+# Pinned to what this project is verified against. pyproject.toml is the source of
+# truth for dependency groups; this file exists because README section 12 calls for
+# it and because `pip install -r requirements.txt` is what most people will try.
+#
+# TensorFlow is pinned deliberately: 2.21 is broken on Windows (the tflite DLL
+# fails to import), and 2.20 is the last version verified working here.
+
+# Core pipeline
+pandas>=2.0
+numpy>=1.26,<2.1
+pyarrow>=14.0
+pyyaml>=6.0
+scikit-learn>=1.4
+
+# Modelling
+tensorflow==2.20.0
+keras>=3.15,<4
+shap>=0.45
+
+# Dashboard
+# Two chart libraries on purpose, not by accident: Plotly draws the interactive
+# screen charts (hover, pan, zoom, click), matplotlib draws the PNG/PDF export and
+# the report figures. Both read the same tokens in dashboard/theme.py.
+streamlit>=1.30
+plotly>=5.18
+matplotlib>=3.8
+
+# Development
+pytest>=8.0
+ruff>=0.4
+mypy>=1.9

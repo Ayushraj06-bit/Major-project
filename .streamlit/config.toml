@@ -1,0 +1,16 @@
+# Generated from dashboard/theme.py -- do not hand-edit.
+#
+# Streamlit styles its widgets from its own theme rather than from our
+# stylesheet. Without this file it follows the viewer's OS colour-scheme
+# preference, so a machine in dark mode drew white label text on the white
+# page our CSS pins, and spent Streamlit's default red on every slider and
+# radio while the project has exactly one accent.
+#
+# tests/test_dashboard.py asserts these values still match the tokens.
+
+[theme]
+base = "light"
+primaryColor = "#0F6E8C"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#FAFAF9"
+textColor = "#1B1A17"
