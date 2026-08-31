@@ -9,16 +9,15 @@ The store holds:
 
 * ``state`` — the area in focus.
 * ``period`` — the target period every panel describes.
-* ``horizon`` — how far past the last observation to project, or ``0`` for the
-  fitted series alone.
+* ``target_date`` — the month the forecast question is asked about.
 * ``show_uncertainty`` — whether interval bands are drawn.
 * ``compare`` — additional states overlaid on the forecast chart.
 
 Streamlit reruns the entire script on every interaction, so "state management"
 here means two things and no more: read the widgets once into a frozen object,
 and make the expensive work depend on that object rather than on the render. The
-projection is cached on ``(state, period, horizon)`` in :mod:`dashboard.data`, so
-dragging the slider and releasing it recomputes once, and re-rendering for a
+projection is cached in :mod:`dashboard.data` on the part of the selection it
+actually depends on, so choosing a month recomputes once and re-rendering for a
 scroll or a resize recomputes nothing.
 
 Streamlit's ``select_slider`` commits on release rather than during the drag,
@@ -35,29 +34,25 @@ from dataclasses import dataclass, field
 import pandas as pd
 import streamlit as st
 
-#: Projection lengths offered in the rail, as label to number of periods.
-#:
-#: Named rather than a free number box. "How many periods ahead" invites a reader
-#: to type 24, and the honest answer to 24 is a refusal, so the control should not
-#: ask the question. The cap itself lives in ``config.yaml``.
-HORIZON_MODES: dict[str, int] = {
-    "Project 3 periods": 3,
-    "Project 6 periods": 6,
-    "Fitted only": 0,
-}
+#: Month names, in order. The picker's second control.
+MONTHS: tuple[str, ...] = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
 
-#: The mode the page opens on. **Projecting, deliberately.**
+#: How many years past the last observation the year picker still offers.
 #:
-#: This used to default to "Fitted only", which meant the forward projection --
-#: the thing the page exists to show -- rendered nothing until a reader noticed
-#: an unremarkable radio button and changed it. An empty chart is indistinguishable
-#: from a broken one, and the feature read as missing rather than as off.
-DEFAULT_HORIZON_MODE = "Project 3 periods"
+#: Deliberately more than the model can answer. The picker accepts a question it
+#: will refuse, because "you may not ask this" explained at the moment of asking
+#: teaches the model's limits, while a greyed-out control that says nothing reads
+#: as a broken one.
+YEARS_BEYOND_REACH = 3
 
 #: Session keys. Collected so nothing else in the package spells one out.
 KEY_STATE = "sel_state"
 KEY_PERIOD = "sel_period"
-KEY_HORIZON = "sel_horizon"
+KEY_TARGET_YEAR = "sel_target_year"
+KEY_TARGET_MONTH = "sel_target_month"
 KEY_UNCERTAINTY = "sel_uncertainty"
 KEY_COMPARE = "sel_compare"
 KEY_PLAYING = "sel_playing"
@@ -88,7 +83,8 @@ class Selection:
     Attributes:
         state: The area in focus.
         period: The target period every panel describes.
-        horizon: Periods to project past the last observation; ``0`` for none.
+        target_date: The month the forecast question is asked about. May be
+            unanswerable; :func:`~dashboard.data.target_verdict` decides.
         show_uncertainty: Whether prediction intervals are drawn.
         compare: Other states overlaid on the forecast chart.
         playing: Whether the period is advancing on its own.
@@ -96,15 +92,14 @@ class Selection:
 
     state: str
     period: pd.Timestamp
-    horizon: int = 0
+    target_date: pd.Timestamp
     show_uncertainty: bool = True
     compare: tuple[str, ...] = field(default_factory=tuple)
     playing: bool = False
 
-    @property
-    def projecting(self) -> bool:
-        """Whether a forward projection was asked for."""
-        return self.horizon > 0
+    def target_label(self) -> str:
+        """The chosen month, spelled the way the interface spells it."""
+        return self.target_date.strftime("%B %Y")
 
     @property
     def overlay(self) -> tuple[str, ...]:
@@ -112,7 +107,7 @@ class Selection:
         others = tuple(name for name in self.compare if name != self.state)
         return (self.state, *others)
 
-    def key(self) -> tuple[str, str, int]:
+    def key(self) -> tuple[str, str, str]:
         """A hashable identity for caching work that depends on this selection.
 
         Deliberately excludes ``show_uncertainty`` and ``compare``: neither
@@ -120,11 +115,11 @@ class Selection:
         away cached work every time someone ticked a checkbox.
 
         Individual caches may key on less than this --
-        :func:`dashboard.data.forecast_curve` ignores the period, because a
-        projection always starts from the last observation -- but nothing should
-        key on more.
+        :func:`dashboard.data.forecast_curve` keys on the state and the number of
+        steps alone, because a projection always starts from the last
+        observation -- but nothing should key on more.
         """
-        return (self.state, self.period.isoformat(), self.horizon)
+        return (self.state, self.period.isoformat(), self.target_date.isoformat())
 
 
 def comparison_options(states: list[str], focus: str) -> list[str]:
@@ -194,7 +189,9 @@ def period_label(period: pd.Timestamp) -> str:
     return pd.Timestamp(period).strftime("%b %Y")
 
 
-def read(states: list[str], periods: list[pd.Timestamp]) -> Selection:
+def read(
+    states: list[str], periods: list[pd.Timestamp], default_target: pd.Timestamp
+) -> Selection:
     """Assemble the current selection from session state.
 
     Reads rather than renders: the widgets are drawn by
@@ -212,16 +209,22 @@ def read(states: list[str], periods: list[pd.Timestamp]) -> Selection:
     if period is None:
         period = periods[-1] if periods else pd.Timestamp.today()
 
-    horizon = HORIZON_MODES.get(
-        st.session_state.get(KEY_HORIZON, DEFAULT_HORIZON_MODE), 0
-    )
     compare = tuple(st.session_state.get(KEY_COMPARE) or ())
 
     return Selection(
         state=str(state),
         period=pd.Timestamp(period),
-        horizon=int(horizon),
+        target_date=target_date(default_target),
         show_uncertainty=bool(st.session_state.get(KEY_UNCERTAINTY, True)),
         compare=compare,
         playing=bool(st.session_state.get(KEY_PLAYING, False)),
     )
+
+
+def target_date(fallback: pd.Timestamp) -> pd.Timestamp:
+    """The month chosen in the picker, or ``fallback`` before it is drawn."""
+    year = st.session_state.get(KEY_TARGET_YEAR)
+    month = st.session_state.get(KEY_TARGET_MONTH)
+    if year is None or month not in MONTHS:
+        return pd.Timestamp(fallback).normalize().replace(day=1)
+    return pd.Timestamp(year=int(year), month=MONTHS.index(month) + 1, day=1)

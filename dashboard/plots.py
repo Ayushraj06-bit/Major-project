@@ -158,6 +158,7 @@ def forecast_chart(
     forecast: pd.DataFrame,
     *,
     projection: pd.DataFrame | None = None,
+    seasonal: pd.DataFrame | None = None,
     highlight: pd.Timestamp | None = None,
     height: int = 300,
 ) -> go.Figure:
@@ -173,11 +174,15 @@ def forecast_chart(
         forecast: Columns ``date``, ``predicted`` and optionally ``lower``/``upper``.
         projection: Forward curve, same columns plus ``mode`` marking each step
             ``direct`` or ``recursive``.
+        seasonal: The seasonal profile's answer past the recursive cap. Drawn in
+            muted ink rather than the accent, because it comes from a different
+            and weaker model and must not read as the forecast continuing.
         highlight: Period the rest of the page is showing, marked on the axis.
         height: Figure height in pixels.
     """
     has_projection = projection is not None and not projection.empty
-    if history.empty and forecast.empty and not has_projection:
+    has_seasonal = seasonal is not None and not seasonal.empty
+    if history.empty and forecast.empty and not has_projection and not has_seasonal:
         return empty_figure("No forecast available for this state.", height)
 
     figure = _figure(height)
@@ -215,6 +220,17 @@ def forecast_chart(
         )
         _mark_projection_start(figure, projection)
 
+    if has_seasonal:
+        assert seasonal is not None
+        _band(figure, seasonal, theme.SEASONAL_BAND, "seasonal spread")
+        _line(
+            figure, seasonal, theme.SEASONAL_LINE, "seasonal profile",
+            dash="longdash", width=1.8,
+        )
+        _direct_label(
+            figure, seasonal, theme.SEASONAL_LINE, "seasonal", -theme.SPACE["lg"]
+        )
+
     if highlight is not None:
         figure.add_vline(
             x=highlight, line={"color": theme.ACCENT, "width": 1.2},
@@ -222,7 +238,7 @@ def forecast_chart(
 
     # Zero is a real quantity on a case-rate axis, so the baseline belongs there.
     figure.update_yaxes(rangemode="tozero", title_text="cases per 100k")
-    _focus_recent(figure, history, forecast, projection)
+    _focus_recent(figure, history, forecast, projection, seasonal)
     return figure
 
 
@@ -526,4 +542,58 @@ def tile_map(
         visible=False, range=[-max(rows) - 0.2, -min(rows) + 1.2],
         scaleanchor="x", scaleratio=1,
     )
+    return figure
+
+
+def climatology_chart(
+    profile: pd.DataFrame, *, highlight: int | None = None, height: int = 300
+) -> go.Figure:
+    """One state's typical year, with the month in question picked out.
+
+    The right picture for a question about a month years away. A time series
+    running out to 2030 would be eighty months of the same repeated shape, which
+    buries the history that gives the shape its weight and implies a trajectory
+    the profile is not claiming. This shows exactly what the profile knows: what
+    each month looks like here, and how much the years disagree.
+
+    Args:
+        profile: Columns ``label``, ``predicted``, ``lower``, ``upper``.
+        highlight: Position in the year to mark, if any.
+        height: Figure height in pixels.
+    """
+    if profile.empty:
+        return empty_figure("No history to build a profile from.", height)
+
+    figure = _figure(height)
+    figure.add_trace(
+        go.Scatter(
+            x=list(profile["label"]) + list(profile["label"])[::-1],
+            y=list(profile["upper"]) + list(profile["lower"])[::-1],
+            fill="toself", fillcolor=theme.SEASONAL_BAND, line={"width": 0},
+            hoverinfo="skip", showlegend=False, name="spread across years",
+        )
+    )
+    figure.add_trace(
+        go.Scatter(
+            x=profile["label"], y=profile["predicted"], mode="lines+markers",
+            line={"color": theme.SEASONAL_LINE, "width": 2.0, "dash": "longdash"},
+            marker={"size": 6, "color": theme.SEASONAL_LINE},
+            hovertemplate="%{x}: %{y:.2f} per 100k<extra>typical</extra>",
+            name="typical",
+        )
+    )
+
+    if highlight is not None and 0 <= highlight < len(profile):
+        row = profile.iloc[highlight]
+        figure.add_trace(
+            go.Scatter(
+                x=[row["label"]], y=[row["predicted"]], mode="markers",
+                marker={"size": 13, "color": theme.ACCENT},
+                hovertemplate="%{x}: %{y:.2f} per 100k<extra>selected</extra>",
+                name="selected",
+            )
+        )
+
+    figure.update_yaxes(rangemode="tozero", title_text="cases per 100k")
+    figure.update_layout(hovermode="x unified")
     return figure

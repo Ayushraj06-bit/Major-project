@@ -808,3 +808,111 @@ Chasing that found the same bug in a path nobody had exercised: `select_state` w
 
 **Files:** `dashboard/{theme,selection,app}.py`, `.streamlit/config.toml` (new, generated), `tests/test_dashboard.py`
 **Follow-up:** unchanged.
+
+### 2026-08-26 — Ask about a month, get an answer or a reason
+**What:** Replaced the fixed "project 3 or 6 periods" radio with a **year + month picker**. The user names a month; the system answers it, or says precisely why it cannot.
+
+**The design decision, made before coding.** Three options were on the table: hide unreachable months, accept them and refuse with a reason, or raise the cap. **Chose to accept and refuse.** A greyed-out control explains nothing at the moment a reader wants an explanation, and is indistinguishable from a broken one — the same failure mode as the "Fitted only" default I had just removed. Raising the cap was rejected outright: at step 24 reliability is pinned at zero and the band is roughly five times the direct width, which is a seasonal average wearing a forecast's clothing.
+
+**Four outcomes, not two.** This is the substance of the change. A question about 2015 is not the same kind of unanswerable as a question about 2030:
+
+| Target | Answer |
+|---|---|
+| Before the record | "the data starts in <month>" |
+| Inside the record | **the actual observed value**, labelled history |
+| Within `horizon + max_recursive_steps` | a forecast, tagged direct or recursive |
+| Past that | refusal naming the furthest reachable month |
+
+Returning a *prediction* for a month already in the data would invent uncertainty that does not exist and would invite comparing a model output against a period it was fitted on. `src/simulate.py::classify_target` returns a `TargetVerdict` carrying the outcome, the steps ahead, the observed value where one exists, and a displayable reason — a reason, not a bool, because the interface has to say which of the four it is.
+
+**Backend was thin, as expected.** `forecast_horizon` already took a target date and already returned the tagged path; nothing about it needed rebuilding. The new layer is the classifier plus a cached `dashboard/data.py::target_verdict`. The forward projection is now driven by `verdict.steps_ahead` rather than a fixed radio value, so the existing per-(state, steps) cache is reused unchanged.
+
+**One thing fixed in passing, deliberately.** Converting a model-scale value back to cases per 100k needed an inverse transform, and QA-1 records that this decision is written **eight times** with four of them ignoring `data.target_transform`. Rather than add a ninth unguarded site I added `src/features.py::inverse_target_transform` — the companion to the existing `target_level` — and used it. **The other six sites are not migrated**; QA-1 stays open.
+
+**Verified.** Kerala, 1–6 months past the last observation: 0.1603 (direct, reliability 1.00) through 0.2630 (recursive, reliability 0.29). Interval width strictly increasing: 0.0858 → 0.1199 → 0.1451 → 0.1697 → 0.1954 → 0.2331. `2015-07` returns `historical` with observed 0.3324; `2030-01` returns `beyond_reach` with no number. 1.5s per call, cached per selection. Driven in Chromium under a dark OS preference: all four outcomes render, zero exceptions, zero page errors.
+
+**One defect the screenshot caught and the text probe did not** — again. Year and Month sat in two sidebar columns of ~90px each, truncating "2024" to "20..." and "January" to "J...". A picker whose current value cannot be read is not a picker. Stacked vertically.
+
+**Files:** `src/simulate.py`, `src/features.py`, `dashboard/{data,selection,app,views}.py`, `tests/{test_simulate,test_dashboard}.py`
+**Follow-up:** unchanged — Q-01 (no real data; the panel still ends 2023-12-01, so every "forecast" lands in the past), Q-07, QA-1, QA-4.
+
+### 2026-08-26 — A second forecaster, so the dashboard can reach two years out
+**What:** Added a **seasonal-profile forecaster** and a fifth reach. Months past the recursive cap are no longer refused; they are answered by a different model, labelled as such.
+
+**Why a second model rather than a longer recursion.** The recursive path is capped at 6 steps because each step feeds the LSTM its own output and error compounds. A seasonal profile does not compound — it repeats — so it reaches two years honestly. What it gives up is responsiveness: it cannot see an unusual monsoon coming. Both facts are on screen.
+
+**It was measured before it was shipped.** Rolling-origin folds, same harness, no bespoke path:
+
+| horizon | gbm | ridge | **seasonal_trend** | seasonal_naive | lstm |
+|---|---|---|---|---|---|
+| h=1 | 0.0225 | 0.0225 | **0.0232** | 0.0282 | 0.0265 |
+| h=3 | 0.0230 | 0.0233 | **0.0237 ± 0.0012** | 0.0287 | 0.0292 |
+
+Third place, within one fold-std of the best, and it **beats the LSTM at both horizons**. The property that earns it the long-range slot: from h=1 to h=3 it degrades **+2%** while the LSTM degrades **+10%**. Per-fold at h=3: 0.0223, 0.0239, 0.0234, 0.0252.
+
+**Two deviations from the brief, both argued before coding (E-07).**
+
+1. **Level anchor, not a trend slope.** A slope fitted on fourteen years and extrapolated 24 months compounds a straight line into territory no data supports — and it looks *best* on smooth synthetic data, which is exactly when it should be trusted least. The profile is instead shifted by how the recent year sits against its own seasonal mean. This is what damped-trend methods do, and why damping exists.
+2. **No change to `build_features`.** The `Forecaster` protocol deliberately hands models a tensor with no index, so a model cannot cheat on time. Rather than add a `time_index` feature to the shared pipeline for one model — touching A-1 and every other model — the month is recovered from the existing `season_sin`/`season_cos` columns (`atan2` inverts the encoding exactly) and the state from its one-hot. A-1 is untouched.
+
+**A divergence worth naming.** `seasonal.trailing_years: 10` applies to the **projector only**. The harness variant trains on the whole fold, as every other model does, because the protocol supplies no dates to slice by. The comparison table therefore describes the model family; the projector is that family restricted to recent years.
+
+**Interval from a different source, deliberately.** Empirical quantiles of each state's own past Septembers, asymmetric because case-rate seasons are right-skewed. Not the LSTM's conformal residuals, and the caption says so: "the spread of past years, not a calibrated prediction interval."
+
+**Verified.** Kerala projections 3/6/12/18/24 months out; **9ms for five projections** against 1.5s for one recursive call. Interval width does **not** grow with distance (0.0612 at both 6 and 18 months) — the opposite of the recursive path, and the point. Shifting the target six months changes the answer **7.04x**, so the profile is genuinely seasonal. 11 new tests including zero-variance safety and thin-history degradation.
+
+**One finding not caused by this change, worth recording: the LSTM fails its gate at horizon 3** — 0.0292 against seasonal-naive's 0.0287. The h=1 pass is already logged; the h=3 failure was not.
+
+**Two defects the screenshot caught after the text probe passed** — the pattern holds. A gap between the recursive segment ending and the seasonal segment starting, which read as missing data rather than a handover between models; and the staleness note not firing on the seasonal path, where it matters most (December 2025 is 33 months behind today). Both fixed: the forecast model now runs as far as it honestly can even when the profile answers, so the chart shows solid → dotted → long-dash continuously.
+
+**Files:** `src/models/seasonal.py` (new), `src/models/naive.py`, `src/simulate.py`, `src/config.py`, `config.yaml`, `dashboard/{data,views,plots,theme}.py`, `tests/{test_seasonal,test_simulate,test_evaluate}.py`
+**Follow-up:** unchanged — Q-01, Q-07, QA-1, QA-4. New: the LSTM's h=3 gate failure needs a decision.
+
+### 2026-08-26 — The seasonal projector gained the trend I had argued against
+**What:** Added a fitted long-run trend to the seasonal projector. The user had asked for "trend and patterns"; I built pattern-only and argued against extrapolating a slope. They restated the ask, so it is their call and it is now built — but built damped, and backtested rather than assumed.
+
+**The problem it fixes.** Without a trend the profile *repeats*: a 24-month projection returned the identical number to the 12-month one. Correct for a pure climatology, and I had it pinned by a test, but it is not what "predict the future from the trend and patterns of the last 10 years" means.
+
+**Implemented as one regression, not two mechanisms.** Deseasonalise, then fit `residual = level + slope x periods_from_the_end` over the trailing window. The intercept *is* the level anchor and the slope is the drift, so the anchor no longer double-counts what the trend already explains. This replaced `_anchor_shift` rather than sitting beside it (E-02).
+
+**Damped, with the damping in config.** `_damped_steps` gives `phi + phi^2 + ... + phi^k`, which at `phi = 1` is a straight line extrapolated as far as asked and below 1 converges to `phi/(1-phi)`. Measured on a 2%-per-month rising series, 24 months out: trend off 3.30, **damped 0.9 → 9.41**, undamped 11.78. The undamped figure is the runaway I was worried about, now visible and switchable rather than hidden.
+
+**Backtested, because nothing else validates a trend term.** The harness cannot: the `Forecaster` protocol supplies no dates, so the fold-scored variant has no trend. Held out the final 24 months, fit on the rest, scored every state at every lead:
+
+| variant | MAE 1-12mo | MAE 13-24mo | MAE all |
+|---|---|---|---|
+| trend off | 0.0216 | 0.0261 | 0.0239 |
+| **damped 0.9** | **0.0207** | **0.0254** | **0.0231** |
+| undamped 1.0 | 0.0207 | 0.0255 | 0.0231 |
+
+Trend helps by 3.3%, and damped is fractionally better than undamped in the far window while being strictly safer on data that actually trends. That is the evidence for the default, and it is worth having because on this panel the trend is nearly invisible: **+0.0004 at 24 months**. The synthetic generator's ramp all but vanishes once cases become a rate and the rate is log-transformed. A correct trend term can move nothing here, which is exactly why the mechanism was verified against known growth rates (0% → zero drift and 12mo == 24mo; 0.5% → +0.024; 2% → +1.07) rather than against the shipped panel alone.
+
+**Surfaced, not buried.** The metric row now says what share of the answer is extrapolation — "of which 12% is fitted trend" — because a number carried by a fitted line deserves more scepticism than one carried by ten observed Septembers, and the interface should not make them look alike.
+
+**Files:** `src/models/seasonal.py`, `src/config.py`, `config.yaml`, `dashboard/views.py`, `tests/test_seasonal.py`
+**Follow-up:** the trend is **projector-only and unmeasured by the harness** — the backtest above is the only evidence for it. Unchanged: Q-01, Q-07, QA-1, QA-4, and the LSTM h=3 gate failure.
+
+### 2026-08-26 — Any future month is now answerable, by saying a smaller thing
+**What:** The picker reaches 2048 and August 2030 returns an outlook. Asked for a third time, so it is the user's call — but built so the answer is true rather than merely present.
+
+**The distinction that makes it honest.** *"An August in Delhi is typically 0.44 cases per 100k, from ten past Augusts"* is a claim about **Augusts**. It is exactly as well-supported for 2030 as for next year, because it says nothing about 2030 at all. What breaks at seven years is not the seasonal pattern but the two things attached to it: the level anchor (how *this* year is running says nothing about 2030) and the trend (extrapolated that far it is arithmetic, not evidence). So past the anchored window both are dropped and what remains is bare climatology, labelled as a typical month rather than as a forecast for a year.
+
+**A fourth tier, each handing off to a weaker claim:**
+
+| reach | window | what answers |
+|---|---|---|
+| `FORECASTABLE` | ≤ Jul 2024 | LSTM, direct then recursive |
+| `SEASONAL` | ≤ Dec 2025 | profile + level anchor + damped trend |
+| `CLIMATOLOGY` | ≤ 2048 | profile alone — no anchor, no trend |
+| `BEYOND_REACH` | past that | refusal: the climate and reporting regime cannot be assumed unchanged |
+
+**The model degrades itself**, rather than trusting the caller to ask correctly: `project_seasonal` computes its own distance and drops the anchor and trend past `seasonal.max_projection_periods`. A UI bug cannot produce an anchored 2030 projection.
+
+**A different chart, because a different question.** Drawing the time series out to 2030 would be eighty months of the same repeated shape — it would imply a trajectory the profile does not claim and squeeze the history that gives it weight into the left margin. Past the anchored window the panel shows the **typical year** instead: all twelve months with their between-year spread, the selected month picked out in the accent. That is exactly what the profile knows.
+
+**Pinned by tests that would catch the tempting mistakes:** August 2030 and August 2031 must return *identical* numbers (any difference would be the model implying it knows something about 2031); a far month must report `anchored=False` and zero trend; and the typical-year chart must agree with the headline number, since they are computed by different functions and nothing else would stop them disagreeing about the same month on the same screen.
+
+**One real bug found by a test on noiseless data.** A month whose years agree exactly leaves residuals that are floating-point dust rather than zero, and a `+1e-17` quantile offset put the lower bound *above* the estimate it was bounding. The band is now clamped to bracket its centre.
+
+**Files:** `src/models/seasonal.py`, `src/simulate.py`, `src/config.py`, `config.yaml`, `dashboard/{app,views,plots,data}.py`, `tests/{test_seasonal,test_simulate}.py`
+**Follow-up:** unchanged — Q-01 remains the reason none of this is about dengue yet, and the reason every answerable month is still in the past relative to today.

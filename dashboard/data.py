@@ -289,6 +289,86 @@ def _period_offset(cfg: Config) -> pd.DateOffset:
     return pd.DateOffset(weeks=1)
 
 
+@st.cache_data(show_spinner=False)
+def target_verdict(state: str, target_iso: str) -> Any:
+    """Whether one month can be answered for one state, and on what basis.
+
+    The gate in front of every forward projection. Cached on the pair, because
+    the answer changes only when the selection does -- and because it is what the
+    forecast panel, the headline number and the caption all read, so computing it
+    three times per render would be three times the work for one answer.
+
+    Returns:
+        A :class:`~src.simulate.TargetVerdict`, or ``None`` when the state cannot
+        be classified at all (no observations, or no frozen model). ``None`` is a
+        renderable state, not an error.
+    """
+    from src.simulate import SimulationError, classify_target
+
+    try:
+        model = production()
+        return classify_target(
+            load().panel, state, pd.Timestamp(target_iso), load_config(),
+            horizon=int(model.spec.horizon),
+        )
+    except (SimulationError, FileNotFoundError, KeyError):
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def seasonal_projection(state: str, target_iso: str) -> Any:
+    """What the seasonal profile says about one month for one state.
+
+    The dashboard's third live computation, and by far the cheapest -- it fits a
+    per-month profile from the panel rather than running the network, so it costs
+    milliseconds where a recursive projection costs seconds.
+
+    Returns:
+        A :class:`~src.models.seasonal.SeasonalProjection`, or ``None`` when the
+        state has no history to profile. ``None`` is a renderable state.
+    """
+    from src.models.seasonal import SeasonalError, project_seasonal
+
+    try:
+        return project_seasonal(load().panel, state, pd.Timestamp(target_iso), load_config())
+    except (SeasonalError, KeyError):
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def climatology_year(state: str) -> pd.DataFrame:
+    """One state's typical year, cached. Empty when it has no history."""
+    from src.models.seasonal import SeasonalError
+    from src.models.seasonal import climatology_year as build
+
+    try:
+        return build(load().panel, state, load_config())
+    except (SeasonalError, KeyError):
+        return pd.DataFrame(
+            columns=["position", "label", "predicted", "lower", "upper", "observed"]
+        )
+
+
+def default_target(dataset: DashboardData, state: str) -> pd.Timestamp:
+    """The month the picker opens on: the first one after the data ends.
+
+    Not today. The projection runs forward from the last observation, and with
+    the data ending in 2023 a picker defaulting to the current month would open
+    on something the model cannot answer.
+    """
+    cfg = load_config()
+    try:
+        last = dataset.panel.loc[state, cfg.data.target_column].dropna().index.max()
+    except (KeyError, AttributeError):
+        return pd.Timestamp.today().normalize().replace(day=1)
+    step = (
+        pd.DateOffset(months=1)
+        if cfg.project.granularity == "monthly"
+        else pd.DateOffset(weeks=1)
+    )
+    return pd.Timestamp(last) + step
+
+
 def watchlist(dataset: DashboardData, period: pd.Timestamp) -> pd.DataFrame:
     """States whose forecast crosses their own high tier at or before a period.
 

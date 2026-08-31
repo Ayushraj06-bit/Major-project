@@ -561,6 +561,23 @@ def target_level(frame: pd.DataFrame, cfg: Config) -> pd.Series:
     return transformed.rename(TARGET_LEVEL_COLUMN)
 
 
+def inverse_target_transform(values: Any, cfg: Config) -> Any:
+    """Back from the model's scale to cases per 100,000.
+
+    The exact inverse of the transform :func:`target_level` applies, and the only
+    place that decision should be made. ``data.target_transform`` is a validated
+    config option with two legal values, so a site that hardcodes ``expm1``
+    silently exponentiates an already-linear rate the moment anyone sets it to
+    ``none`` -- no crash, just wrong numbers everywhere downstream.
+
+    Floored at zero: a negative case rate is not a quantity, and ``expm1`` of a
+    sufficiently negative log value produces one.
+    """
+    if cfg.data.target_transform == "log1p":
+        return np.maximum(np.expm1(values), 0.0)
+    return values
+
+
 def apply_selection(
     features: dict[str, pd.Series],
     origins: dict[str, FeatureOrigin],

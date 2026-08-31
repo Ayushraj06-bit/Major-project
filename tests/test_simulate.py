@@ -635,3 +635,125 @@ def test_climatological_normals_are_per_state_and_per_month(
     kerala = sim_panel.loc["Kerala"]
     expected = kerala[kerala.index.month == 10]["rainfall"].mean()
     assert normals.loc[("Kerala", 10), "rainfall"] == pytest.approx(expected)
+
+
+# --------------------------------------------------------------------------- #
+# Is a target month answerable?
+# --------------------------------------------------------------------------- #
+
+
+def _verdict(panel: pd.DataFrame, cfg: Config, when: str, state: str = "Kerala") -> object:
+    from src.simulate import classify_target
+
+    return classify_target(panel, state, pd.Timestamp(when), cfg, horizon=1)
+
+
+def test_a_month_already_recorded_returns_the_actual_not_a_forecast(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    """The distinction the whole classifier exists for.
+
+    Asking about 2015 has a real answer in the data. Returning a *prediction*
+    would invent uncertainty that does not exist, and would let a reader compare
+    a model output against a period the model was fitted on.
+    """
+    from src.simulate import HISTORICAL
+
+    verdict = _verdict(sim_panel, sim_cfg, "2015-07-01")
+
+    assert verdict.reach == HISTORICAL
+    assert verdict.is_observed and not verdict.is_forecast
+    assert verdict.observed_cases_per_100k is not None
+    assert verdict.observed_cases_per_100k >= 0.0
+    assert "not a prediction" in verdict.reason
+
+
+def test_a_month_before_the_record_is_refused(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    from src.simulate import BEFORE_DATA
+
+    verdict = _verdict(sim_panel, sim_cfg, "1998-01-01")
+    assert verdict.reach == BEFORE_DATA
+    assert verdict.observed_cases_per_100k is None
+
+
+def test_a_month_within_the_cap_is_forecastable(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    last = sim_panel.loc["Kerala", "cases"].dropna().index.max()
+    target = pd.Timestamp(last) + pd.DateOffset(months=2)
+
+    from src.simulate import FORECASTABLE
+
+    verdict = _verdict(sim_panel, sim_cfg, target.isoformat())
+    assert verdict.reach == FORECASTABLE
+    assert verdict.steps_ahead == 2
+    assert verdict.is_forecast
+
+
+def test_a_month_past_every_model_is_refused_with_the_furthest_reachable(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    """Refusing loudly, and saying how far it *can* go, beats extrapolating."""
+    from src.simulate import BEYOND_REACH
+
+    last = pd.Timestamp(sim_panel.loc["Kerala", "cases"].dropna().index.max())
+    far = last + pd.DateOffset(years=sim_cfg.seasonal.climatology_max_years + 5)
+
+    verdict = _verdict(sim_panel, sim_cfg, far.isoformat())
+    assert verdict.reach == BEYOND_REACH
+    assert verdict.observed_cases_per_100k is None
+    assert not verdict.is_forecast and not verdict.is_seasonal
+    assert not verdict.is_climatology and not verdict.answerable
+    assert verdict.furthest_climatology.strftime("%B %Y") in verdict.reason
+
+
+def test_each_boundary_is_a_config_decision_not_an_accident(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    """Three boundaries, each a config value, each handing off to a weaker claim.
+
+    Recursion stops where it would be reading its own output too many times over.
+    The anchored profile stops where the current year says nothing useful. Bare
+    climatology stops where "a typical August" stops being credible at all.
+    """
+    from src.simulate import BEYOND_REACH, CLIMATOLOGY, FORECASTABLE, SEASONAL
+
+    last = pd.Timestamp(sim_panel.loc["Kerala", "cases"].dropna().index.max())
+    recursive_edge = 1 + sim_cfg.forecast.max_recursive_steps
+    seasonal_edge = sim_cfg.seasonal.max_projection_periods
+    climatology_edge = sim_cfg.seasonal.climatology_max_years * 12
+
+    def reach_at(months: int) -> str:
+        return _verdict(
+            sim_panel, sim_cfg, (last + pd.DateOffset(months=months)).isoformat()
+        ).reach
+
+    assert reach_at(recursive_edge) == FORECASTABLE
+    assert reach_at(recursive_edge + 1) == SEASONAL
+    assert reach_at(seasonal_edge) == SEASONAL
+    assert reach_at(seasonal_edge + 1) == CLIMATOLOGY
+    assert reach_at(climatology_edge) == CLIMATOLOGY
+    assert reach_at(climatology_edge + 12) == BEYOND_REACH
+
+
+def test_an_unknown_state_is_refused_by_name(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    from src.simulate import SimulationError, classify_target
+
+    with pytest.raises(SimulationError, match="Atlantis"):
+        classify_target(
+            sim_panel, "Atlantis", pd.Timestamp("2018-01-01"), sim_cfg, horizon=1
+        )
+
+
+def test_a_mid_month_date_is_normalised_to_its_month(
+    sim_panel: pd.DataFrame, sim_cfg: Config
+) -> None:
+    """A picker sends the first of the month, but a caller may not."""
+    mid = _verdict(sim_panel, sim_cfg, "2015-07-17")
+    first = _verdict(sim_panel, sim_cfg, "2015-07-01")
+    assert mid.target_date == first.target_date
+    assert mid.reach == first.reach

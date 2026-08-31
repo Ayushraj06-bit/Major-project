@@ -198,6 +198,13 @@ def ridge(cfg: Config) -> ForecasterFactory:
     return lambda: StandardScaled(RidgeBaseline(cfg))
 
 
+def _seasonal_trend(spec: FeatureSpec, cfg: Config) -> ForecasterFactory:
+    """The seasonal-profile forecaster. Imported here to keep the module acyclic."""
+    from src.models.seasonal import seasonal_trend
+
+    return seasonal_trend(spec, cfg)
+
+
 def _column_index(spec: FeatureSpec, column: str) -> int:
     """Position of a required column, with an actionable error when absent."""
     try:
@@ -229,6 +236,12 @@ def baseline_builders(
         "seasonal_naive": lambda: seasonal_naive(spec, cfg),
         "gbm": lambda: gradient_boosting(cfg),
         "ridge": lambda: ridge(cfg),
+        # A different kind of model from the three above: a seasonal profile
+        # rather than a lookup or a regression on the flat view. It lives in
+        # src/models/seasonal.py because it is long enough to warrant its own
+        # module, and is registered here so one place still lists every model the
+        # comparison and the ablation table run.
+        "seasonal_trend": lambda: _seasonal_trend(spec, cfg),
     }
 
 

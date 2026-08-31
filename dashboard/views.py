@@ -14,6 +14,8 @@ the panels beside it answering a different question.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,6 +23,9 @@ import streamlit as st
 from dashboard import charts, components, data, plots, theme
 from dashboard.geo import TILE_POSITIONS
 from dashboard.selection import KEY_STATE, Selection, select_state
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime dependency
+    from src.simulate import TargetVerdict
 
 #: How far behind "now" the data may fall before the chart says so.
 #:
@@ -167,16 +172,54 @@ def forecast_view(dataset: data.DashboardData, selection: Selection) -> None:
         components.empty_state(f"No series recorded for {selection.state}.")
         return
 
+    verdict = data.target_verdict(selection.state, selection.target_date.isoformat())
+    if verdict is not None and verdict.is_climatology:
+        _typical_year_view(selection)
+        return
+
     projection = _projection_frame(selection)
     figure = plots.forecast_chart(
         history=history[["date", "actual"]],
         forecast=_forecast_frame(forecasts, selection.show_uncertainty),
         projection=projection,
+        seasonal=_seasonal_frame(selection),
         highlight=selection.period,
         height=theme.PANEL_HEIGHT["chart"] - theme.CHART_INSET["plain"],
     )
     st.plotly_chart(figure, use_container_width=True, config=plots.TOOLBAR)
     components.note(_forecast_caption(selection, projection))
+
+
+def _typical_year_view(selection: Selection) -> None:
+    """The typical year, when the question is about a month years away.
+
+    Replaces the time series rather than extending it. A line drawn from the last
+    observation out to 2030 would be years of the same repeated shape, which
+    implies a trajectory the profile is not claiming and squeezes the history that
+    gives it weight into the left margin.
+    """
+    profile = data.climatology_year(selection.state)
+    if profile.empty:
+        components.empty_state(f"No history to profile for {selection.state}.")
+        return
+
+    st.plotly_chart(
+        plots.climatology_chart(
+            profile,
+            highlight=int(selection.target_date.month - 1),
+            height=theme.PANEL_HEIGHT["chart"] - theme.CHART_INSET["plain"],
+        ),
+        use_container_width=True,
+        config=plots.TOOLBAR,
+    )
+    components.note(
+        f"The typical year in {selection.state}, from the last "
+        f"{int(profile['observed'].max())} years of record. The accent marks "
+        f"{selection.target_date.strftime('%B')}; the band is how much that month "
+        "has varied between years, not a prediction interval. The time series is "
+        "not shown because a projection this far out would be the same shape "
+        "repeated, which would imply a trajectory this profile does not claim."
+    )
 
 
 def _forecast_frame(forecasts: pd.DataFrame, show_uncertainty: bool) -> pd.DataFrame:
@@ -194,15 +237,30 @@ def _forecast_frame(forecasts: pd.DataFrame, show_uncertainty: bool) -> pd.DataF
 
 
 def _projection_frame(selection: Selection) -> pd.DataFrame:
-    """The forward curve for this selection, shaped for the chart.
+    """The forward curve out to the selected month, shaped for the chart.
 
-    Empty when no projection was asked for, or when the state cannot be projected.
-    Both are normal and both render as simply no dashed line.
+    Empty when the month is not forecastable -- already past, before the data, or
+    beyond the cap. All three are normal, and all three render as no dashed line
+    plus a panel that says which one it is.
     """
+    verdict = data.target_verdict(selection.state, selection.target_date.isoformat())
+    if verdict is None or not (verdict.is_forecast or verdict.is_seasonal):
+        return pd.DataFrame(columns=["date", "predicted", "lower", "upper", "mode"])
+
+    # When the seasonal profile answers, the forecast model still runs as far as
+    # it honestly can. Drawing only the seasonal segment would leave a gap
+    # between the last observation and where that segment starts, which reads as
+    # missing data rather than as a handover between two models.
+    steps = (
+        int(verdict.steps_ahead)
+        if verdict.is_forecast
+        else _periods_to(verdict.last_observed, verdict.furthest_forecastable)
+    )
+
     with components.loading(
-        f"Projecting {selection.state} {selection.horizon} periods ahead…"
+        f"Projecting {selection.state} to {selection.target_label()}…"
     ):
-        curve = data.forecast_curve(selection.state, selection.horizon)
+        curve = data.forecast_curve(selection.state, steps)
     if curve.empty:
         return curve
     frame = curve.rename(columns={"target_date": "date"})
@@ -212,6 +270,327 @@ def _projection_frame(selection: Selection) -> pd.DataFrame:
     return frame[columns]
 
 
+def _seasonal_frame(selection: Selection) -> pd.DataFrame:
+    """The seasonal profile's path from the recursive cap out to the target.
+
+    The whole segment, not just the endpoint, so the reader sees the profile's
+    shape rather than one number. Empty unless the selected month is past the
+    recursive cap -- inside it, the forecast model answers and drawing a second
+    line would invite comparing them as if they were the same claim.
+    """
+    columns = ["date", "predicted", "lower", "upper"]
+    verdict = data.target_verdict(selection.state, selection.target_date.isoformat())
+    if verdict is None or not verdict.is_seasonal:
+        return pd.DataFrame(columns=columns)
+
+    months = pd.date_range(
+        verdict.furthest_forecastable, selection.target_date, freq="MS"
+    )
+    rows = []
+    for month in months:
+        projection = data.seasonal_projection(selection.state, month.isoformat())
+        if projection is None:
+            continue
+        rows.append(
+            {
+                "date": month,
+                "predicted": projection.predicted_cases_per_100k,
+                "lower": projection.lower_cases_per_100k,
+                "upper": projection.upper_cases_per_100k,
+            }
+        )
+    frame = pd.DataFrame(rows, columns=columns)
+    if not selection.show_uncertainty:
+        return frame[["date", "predicted"]]
+    return frame
+
+
+def _periods_to(start: pd.Timestamp, end: pd.Timestamp) -> int:
+    """Whole months between two period starts."""
+    return max(
+        0,
+        (end.year - start.year) * 12 + (end.month - start.month),
+    )
+
+
+def answer_view(dataset: data.DashboardData, selection: Selection) -> None:
+    """The headline answer to "what will happen in this month?".
+
+    Four different answers, and telling them apart is the point. A month already
+    in the record has a real value and must not be dressed as a prediction; a
+    month past the cap has no answer at all and must not be given a number.
+    """
+    verdict = data.target_verdict(selection.state, selection.target_date.isoformat())
+    if verdict is None:
+        components.empty_state(
+            f"Cannot answer for {selection.state}.",
+            "This state has no observations to project from, or the frozen model "
+            "is missing. Run scripts/freeze_production.py.",
+        )
+        return
+
+    if verdict.is_observed:
+        _observed_answer(dataset, selection, verdict)
+        return
+    if verdict.is_seasonal:
+        _seasonal_answer(dataset, selection, verdict)
+        return
+    if verdict.is_climatology:
+        _climatology_answer(dataset, selection, verdict)
+        return
+    if not verdict.is_forecast:
+        components.empty_state(
+            f"No forecast for {selection.target_label()}.", verdict.reason
+        )
+        return
+
+    _forecast_answer(dataset, selection, verdict)
+
+
+def _observed_answer(
+    dataset: data.DashboardData, selection: Selection, verdict: TargetVerdict
+) -> None:
+    """A month already in the record. Report what happened, not a prediction."""
+    observed = verdict.observed_cases_per_100k
+    if observed is None:
+        components.empty_state(
+            f"No record for {selection.state} in {selection.target_label()}.",
+            "The month is inside the study period but this state has no value for it.",
+        )
+        return
+
+    components.metric_row(
+        [
+            ("Observed", f"{observed:.2f}", "cases per 100,000"),
+            ("Month", selection.target_label(), "already recorded"),
+            ("Basis", "History", "not a prediction"),
+        ]
+    )
+    components.spacer("sm")
+    components.note(verdict.reason)
+
+
+def _seasonal_answer(
+    dataset: data.DashboardData, selection: Selection, verdict: TargetVerdict
+) -> None:
+    """A month past the recursive cap, answered by the seasonal profile.
+
+    A **different model** from the one that answers nearer months, so it says so
+    in the metric row rather than in a footnote. Presenting a climatological
+    pattern in the same words as a conditional forecast would be the single most
+    misleading thing this interface could do.
+    """
+    projection = data.seasonal_projection(
+        selection.state, selection.target_date.isoformat()
+    )
+    if projection is None:
+        components.empty_state(
+            f"No seasonal profile for {selection.state}.",
+            "This state has no observed history to build a monthly profile from.",
+        )
+        return
+
+    bounds = (
+        f"{projection.lower_cases_per_100k:.2f}–"
+        f"{projection.upper_cases_per_100k:.2f}"
+        if selection.show_uncertainty
+        else "hidden"
+    )
+    components.metric_row(
+        [
+            (
+                "Typically",
+                f"{projection.predicted_cases_per_100k:.2f}",
+                "cases per 100,000",
+            ),
+            (
+                f"{dataset.meta['interval_coverage']:.0%} of past years",
+                bounds,
+                "observed spread for this month",
+            ),
+            (
+                "Basis",
+                "Seasonal profile",
+                f"{projection.years_observed} past "
+                f"{selection.target_date.strftime('%B')}s"
+                + (", anchored to the recent level" if projection.anchored else "")
+                + _trend_note(projection),
+            ),
+        ]
+    )
+
+    components.spacer("md")
+    tier = _tier_for(dataset, selection.state, projection.predicted_cases_per_100k)
+    if tier:
+        st.markdown(components.tier_badge(tier), unsafe_allow_html=True)
+        components.spacer("sm")
+    components.note(
+        f"This is <b>not the forecast model</b>. {verdict.reason} It describes "
+        f"what {selection.target_date.strftime('%B')} usually looks like in "
+        f"{selection.state}, so it cannot see an unusual season coming and will "
+        "miss an outbreak the calendar did not predict. Its band is the spread of "
+        "past years, not a calibrated prediction interval."
+        + _staleness_note(verdict.last_observed)
+    )
+
+
+def _climatology_answer(
+    dataset: data.DashboardData, selection: Selection, verdict: TargetVerdict
+) -> None:
+    """A month years away, answered by the record of that month.
+
+    Framed as *"a typical August"* rather than *"August 2030"*, because that is
+    the claim the data supports. The profile says what Augusts look like here; it
+    says nothing whatever about 2030, and the heading must not imply otherwise.
+    """
+    projection = data.seasonal_projection(
+        selection.state, selection.target_date.isoformat()
+    )
+    if projection is None:
+        components.empty_state(
+            f"No profile for {selection.state}.",
+            "This state has no observed history to build a monthly profile from.",
+        )
+        return
+
+    month = selection.target_date.strftime("%B")
+    bounds = (
+        f"{projection.lower_cases_per_100k:.2f}–"
+        f"{projection.upper_cases_per_100k:.2f}"
+        if selection.show_uncertainty
+        else "hidden"
+    )
+    components.metric_row(
+        [
+            (
+                f"A typical {month}",
+                f"{projection.predicted_cases_per_100k:.2f}",
+                "cases per 100,000",
+            ),
+            (
+                f"{dataset.meta['interval_coverage']:.0%} of past years",
+                bounds,
+                f"how much {month}s differ here",
+            ),
+            (
+                "Basis",
+                "Climatology",
+                f"{projection.years_observed} past {month}s · no forecast model, "
+                "no current-year adjustment",
+            ),
+        ]
+    )
+
+    components.spacer("md")
+    tier = _tier_for(dataset, selection.state, projection.predicted_cases_per_100k)
+    if tier:
+        st.markdown(components.tier_badge(tier), unsafe_allow_html=True)
+        components.spacer("sm")
+    components.note(
+        f"<b>This is not a prediction about {selection.target_date.year}.</b> "
+        f"{verdict.reason} It is a claim about {month}s, which is why it holds up "
+        f"this far out — and it is also why it cannot tell you whether "
+        f"{selection.target_date.year} will be a bad year. It assumes the climate "
+        "and the reporting behind it are unchanged."
+    )
+
+
+def _trend_note(projection: object) -> str:
+    """How much of the answer is extrapolation rather than pattern.
+
+    Stated as a share of the value, because that is the question a reader has:
+    "is this number the seasonal average, or is it mostly a line drawn forward?"
+    A projection carried by its trend deserves more scepticism than one carried
+    by ten observed Septembers, and the interface should not make them look alike.
+    """
+    shift = float(getattr(projection, "trend_shift", 0.0))
+    value = float(getattr(projection, "predicted_cases_per_100k", 0.0))
+    if abs(shift) < 1e-4 or value <= 0.0:
+        return ""
+    return f", of which {abs(shift) / value:.0%} is fitted trend"
+
+
+def _forecast_answer(
+    dataset: data.DashboardData, selection: Selection, verdict: TargetVerdict
+) -> None:
+    """A month the model can reach. Report the prediction and how far it reached."""
+    frame = _projection_frame(selection)
+    step = frame[frame["date"] == selection.target_date] if not frame.empty else frame
+    if frame.empty or step.empty:
+        components.empty_state(
+            f"No projection reached {selection.target_label()}.",
+            "The state may have too little history to project from.",
+        )
+        return
+
+    row = step.iloc[0]
+    curve = data.forecast_curve(selection.state, int(verdict.steps_ahead))
+    reliability = float(
+        curve[curve["target_date"] == selection.target_date]["reliability"].iloc[0]
+    )
+    recursive = str(row["mode"]) == "recursive"
+    bounds = (
+        f"{row['lower']:.2f}–{row['upper']:.2f}"
+        if {"lower", "upper"} <= set(frame.columns)
+        else "hidden"
+    )
+
+    components.metric_row(
+        [
+            ("Predicted", f"{row['predicted']:.2f}", "cases per 100,000"),
+            (
+                f"{dataset.meta['interval_coverage']:.0%} interval",
+                bounds,
+                "lower to upper bound",
+            ),
+            (
+                "Basis",
+                "Recursive" if recursive else "Direct",
+                f"{verdict.steps_ahead} period(s) ahead · reliability "
+                f"{reliability:.0%}",
+            ),
+        ]
+    )
+
+    components.spacer("md")
+    tier = _tier_for(dataset, selection.state, float(row["predicted"]))
+    if tier:
+        st.markdown(components.tier_badge(tier), unsafe_allow_html=True)
+        components.spacer("sm")
+    components.note(_answer_caption(verdict, recursive))
+
+
+def _tier_for(
+    dataset: data.DashboardData, state: str, value: float
+) -> str | None:
+    """The risk tier a predicted rate falls in, using this state's own thresholds.
+
+    Compared on the reported case-rate scale, which is the scale the thresholds
+    table stores alongside its log values.
+    """
+    thresholds = dataset.thresholds_for(state)
+    if thresholds.empty:
+        return None
+    crossed = thresholds[thresholds["value_cases_per_100k"] <= value]
+    if crossed.empty:
+        return str(data.config().risk.tiers[0])
+    return str(crossed.sort_values("value_cases_per_100k").iloc[-1]["tier"])
+
+
+def _answer_caption(verdict: TargetVerdict, recursive: bool) -> str:
+    """What this number is, and what it is not."""
+    origin = verdict.last_observed.strftime("%B %Y")
+    base = f"Projected forward from {origin}, the last period with data."
+    if not recursive:
+        return base + " Every input to this step was really observed."
+    return base + (
+        " This step is <b>recursive</b>: the model is reading its own earlier "
+        "predictions, with climatological normals standing in for weather nobody "
+        "has observed. The interval is widened to acknowledge that, which is not "
+        "the same as a coverage guarantee."
+    )
+
+
 def _forecast_caption(selection: Selection, projection: pd.DataFrame) -> str:
     """What the chart is showing, including what it cannot promise."""
     base = (
@@ -219,12 +598,11 @@ def _forecast_caption(selection: Selection, projection: pd.DataFrame) -> str:
         f"{selection.period.strftime('%B %Y')}, the period shown above."
     )
     if projection.empty:
-        if selection.projecting:
-            return base + (
-                f" No forward projection available for {selection.state}: it has "
-                "too little history to project from."
-            )
-        return base
+        verdict = data.target_verdict(
+            selection.state, selection.target_date.isoformat()
+        )
+        reason = getattr(verdict, "reason", "") if verdict is not None else ""
+        return base + (f" {reason}" if reason else "")
 
     origin = pd.Timestamp(projection["date"].min()) - pd.DateOffset(months=1)
     base += _staleness_note(origin)

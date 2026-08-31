@@ -856,3 +856,217 @@ def _period_offset(cfg: Config) -> pd.DateOffset:
     if cfg.project.granularity == "monthly":
         return pd.DateOffset(months=1)
     return pd.DateOffset(weeks=1)
+
+
+# --------------------------------------------------------------------------- #
+# Is a target month answerable at all?
+# --------------------------------------------------------------------------- #
+
+#: The target month lies before the panel begins.
+BEFORE_DATA = "before_data"
+
+#: The target month already happened and was observed. Report the actual.
+HISTORICAL = "historical"
+
+#: The target month is within reach of a projection.
+FORECASTABLE = "forecastable"
+
+#: Past the recursive cap, but within reach of the seasonal profile.
+#:
+#: A different model answers here, and the interface must say so. The recursive
+#: path stops because it compounds its own error; the seasonal profile does not
+#: compound, so it reaches further -- at the cost of being unable to react to
+#: anything but the current level.
+SEASONAL = "seasonal"
+
+#: Past the anchored window: pure climatology, and a different kind of claim.
+#:
+#: Not a forecast for that year. A statement about that *month* -- "an August
+#: here looks like this" -- which the record supports as well for 2030 as for
+#: next year, because it says nothing about 2030 at all. The level anchor and the
+#: trend are dropped here; what is left is the profile and its historical spread.
+CLIMATOLOGY = "climatology"
+
+#: The target month is further ahead than any model here can honestly reach.
+BEYOND_REACH = "beyond_reach"
+
+
+@dataclass(frozen=True)
+class TargetVerdict:
+    """Whether one month can be answered for one state, and on what basis.
+
+    Four outcomes, not two. A question about 2015 is not the same kind of
+    unanswerable as a question about 2030: the first already has an answer in the
+    data, and returning a *prediction* for it would be inventing uncertainty that
+    does not exist. The interface needs to tell those apart.
+
+    Attributes:
+        reach: One of :data:`BEFORE_DATA`, :data:`HISTORICAL`,
+            :data:`FORECASTABLE`, :data:`SEASONAL`, :data:`CLIMATOLOGY`,
+            :data:`BEYOND_REACH`.
+        steps_ahead: Periods past the last observation. Zero or negative when the
+            month is not in the future.
+        observed_cases_per_100k: The real value, when :data:`HISTORICAL`.
+        reason: A sentence naming what is being shown and why, fit to display.
+    """
+
+    reach: str
+    state: str
+    target_date: pd.Timestamp
+    last_observed: pd.Timestamp
+    furthest_forecastable: pd.Timestamp
+    furthest_seasonal: pd.Timestamp
+    furthest_climatology: pd.Timestamp
+    steps_ahead: int
+    observed_cases_per_100k: float | None
+    reason: str
+
+    @property
+    def is_forecast(self) -> bool:
+        """Whether answering this month means running the LSTM forward."""
+        return self.reach == FORECASTABLE
+
+    @property
+    def is_seasonal(self) -> bool:
+        """Whether the anchored seasonal profile answers this month."""
+        return self.reach == SEASONAL
+
+    @property
+    def is_climatology(self) -> bool:
+        """Whether only the bare typical-month profile answers this."""
+        return self.reach == CLIMATOLOGY
+
+    @property
+    def answerable(self) -> bool:
+        """Whether any model here can say something about this month."""
+        return self.reach in (HISTORICAL, FORECASTABLE, SEASONAL, CLIMATOLOGY)
+
+    @property
+    def is_observed(self) -> bool:
+        """Whether this month already has a real answer in the data."""
+        return self.reach == HISTORICAL
+
+
+def classify_target(
+    panel: pd.DataFrame,
+    state: str,
+    target_date: pd.Timestamp | date,
+    cfg: Config,
+    *,
+    horizon: int,
+) -> TargetVerdict:
+    """Decide how -- or whether -- one month can be answered for one state.
+
+    Called before :func:`forecast_horizon`, and it is what stops the interface
+    fabricating a number. The cap is ``horizon + forecast.max_recursive_steps``
+    past the last observation, and it is a real limit rather than a formatting
+    choice: every step past the trained horizon feeds the model its own output,
+    so error compounds and the interval widens. Extrapolating further would make
+    the feature feel more capable than it is.
+
+    Args:
+        panel: Cleaned wide panel.
+        state: The state being asked about.
+        target_date: The month in question.
+        cfg: Loaded configuration.
+        horizon: The model's trained lead time, from its feature spec.
+
+    Returns:
+        A :class:`TargetVerdict` carrying the outcome and a displayable reason.
+
+    Raises:
+        SimulationError: the state is absent, or has no observations at all.
+    """
+    states = set(panel.index.get_level_values("state"))
+    if state not in states:
+        raise SimulationError(
+            f"{state!r} is not in the panel; available: {sorted(states)}"
+        )
+
+    wanted = pd.Timestamp(target_date).normalize().replace(day=1)
+    last_observed = _last_observed(panel, state, cfg)
+    offset = _period_offset(cfg)
+    furthest = last_observed + offset * (horizon + cfg.forecast.max_recursive_steps)
+    seasonal_edge = last_observed + offset * cfg.seasonal.max_projection_periods
+    climatology_edge = last_observed + pd.DateOffset(
+        years=int(cfg.seasonal.climatology_max_years)
+    )
+
+    dates = pd.DatetimeIndex(panel.loc[state].index)
+    earliest = pd.Timestamp(dates.min())
+
+    def verdict(reach: str, steps: int, observed: float | None, reason: str) -> TargetVerdict:
+        return TargetVerdict(
+            reach=reach, state=state, target_date=wanted,
+            last_observed=last_observed, furthest_forecastable=furthest,
+            furthest_seasonal=seasonal_edge,
+            furthest_climatology=climatology_edge,
+            steps_ahead=steps, observed_cases_per_100k=observed, reason=reason,
+        )
+
+    if wanted < earliest:
+        return verdict(
+            BEFORE_DATA, 0, None,
+            f"The data for {state} starts in {earliest.strftime('%B %Y')}. "
+            f"There is nothing recorded for {wanted.strftime('%B %Y')}.",
+        )
+
+    if wanted <= last_observed:
+        observed = _observed_rate(panel, state, wanted, cfg)
+        return verdict(
+            HISTORICAL, _periods_between(wanted, last_observed, offset) * -1, observed,
+            f"{wanted.strftime('%B %Y')} already happened and was recorded. This is "
+            "the observed value, not a prediction.",
+        )
+
+    steps = _periods_between(last_observed, wanted, offset)
+    if wanted > climatology_edge:
+        return verdict(
+            BEYOND_REACH, steps, None,
+            f"{wanted.strftime('%B %Y')} is past "
+            f"{climatology_edge.strftime('%B %Y')}. Even a statement about what "
+            f"{wanted.strftime('%B')} is typically like assumes the climate and "
+            "the reporting behind it are the same then as now, and that far out "
+            "the assumption is not credible.",
+        )
+
+    if wanted > seasonal_edge:
+        return verdict(
+            CLIMATOLOGY, steps, None,
+            f"{wanted.strftime('%B %Y')} is {steps} periods ahead — too far for "
+            "the forecast model or for any read on how the current year is "
+            f"running. What is left is the record of past {wanted.strftime('%B')}s "
+            f"in this state: what {wanted.strftime('%B')} is typically like here.",
+        )
+
+    if wanted > furthest:
+        return verdict(
+            SEASONAL, steps, None,
+            f"Past {furthest.strftime('%B %Y')} the forecast model would be "
+            "reading its own output too many times over to mean anything, so "
+            f"{wanted.strftime('%B %Y')} is answered by the seasonal profile "
+            "instead: what this month typically looks like here, adjusted for how "
+            "the year is running.",
+        )
+
+    return verdict(
+        FORECASTABLE, steps, None,
+        f"{steps} period(s) after {last_observed.strftime('%B %Y')}, the last "
+        "period with data.",
+    )
+
+
+def _observed_rate(
+    panel: pd.DataFrame, state: str, when: pd.Timestamp, cfg: Config
+) -> float | None:
+    """The recorded case rate for one state and month, on the reported scale."""
+    from src.features import inverse_target_transform, target_level
+
+    levels = target_level(panel, cfg)
+    try:
+        level = levels.loc[(state, when)]
+    except KeyError:
+        return None
+    if not np.isfinite(level):
+        return None
+    return float(inverse_target_transform(np.asarray(level), cfg))

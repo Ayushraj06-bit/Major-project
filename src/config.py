@@ -311,6 +311,36 @@ class ForecastConfig:
 
 
 @dataclass(frozen=True)
+class SeasonalConfig:
+    """The seasonal-profile forecaster's settings.
+
+    A different model from the LSTM, with a different reach and different
+    weaknesses, so it gets its own section rather than extending ``forecast``.
+    """
+
+    trailing_years: int
+    use_level_anchor: bool
+    use_trend: bool
+    trend_damping: float
+    max_projection_periods: int
+    climatology_max_years: int
+
+    def __post_init__(self) -> None:
+        _require_positive(self.trailing_years, "seasonal.trailing_years")
+        _require_positive(
+            self.max_projection_periods, "seasonal.max_projection_periods"
+        )
+        _require_positive(
+            self.climatology_max_years, "seasonal.climatology_max_years"
+        )
+        if not 0.0 <= self.trend_damping <= 1.0:
+            raise ConfigError(
+                "seasonal.trend_damping: must be between 0 (no trend) and 1 "
+                f"(undamped straight line), got {self.trend_damping}"
+            )
+
+
+@dataclass(frozen=True)
 class ConformalConfig:
     """Distribution-free prediction intervals (brain.md S-2, A-2b)."""
 
@@ -546,6 +576,7 @@ class Config:
     model: ModelConfig
     split: SplitConfig
     forecast: ForecastConfig
+    seasonal: SeasonalConfig
     conformal: ConformalConfig
     risk: RiskConfig
     simulate: SimulateConfig

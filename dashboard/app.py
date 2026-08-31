@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 
+import pandas as pd
 import streamlit as st
 
 from dashboard import components, data, selection, theme, views
@@ -70,6 +71,10 @@ def _canvas(dataset: data.DashboardData, current: selection.Selection) -> None:
         views.map_view(dataset, current)
 
     with right, components.panel(current.state, height=theme.PANEL_HEIGHT["detail"]):
+        components.panel_header(f"Outlook for {current.target_label()}")
+        views.answer_view(dataset, current)
+        components.spacer("md")
+        components.panel_header("This period")
         views.summary_view(dataset, current)
         components.spacer("md")
         views.recommendation_view(dataset, current)
@@ -140,20 +145,20 @@ def rail(dataset: data.DashboardData) -> selection.Selection:
             components.note("No periods in the artifact.")
 
         components.spacer("md")
-        components.panel_header("Forward projection")
+        components.panel_header("Forecast month")
+        target = data.default_target(dataset, focus)
+        st.session_state.setdefault(selection.KEY_TARGET_YEAR, int(target.year))
         st.session_state.setdefault(
-            selection.KEY_HORIZON, selection.DEFAULT_HORIZON_MODE
+            selection.KEY_TARGET_MONTH, selection.MONTHS[target.month - 1]
         )
-        st.radio(
-            "Forward projection",
-            list(selection.HORIZON_MODES),
-            label_visibility="collapsed",
-            key=selection.KEY_HORIZON,
+        # Stacked, not side by side. Two columns inside the rail leaves each
+        # selectbox about 90px, which truncated "2024" to "20..." and "January"
+        # to "J..." -- a picker whose current value cannot be read.
+        st.selectbox(
+            "Year", _year_options(dataset, focus), key=selection.KEY_TARGET_YEAR
         )
-        components.note(
-            "Past the trained horizon the model reads its own output. Those steps "
-            "are drawn dotted and shaded, and the interval widens with each one."
-        )
+        st.selectbox("Month", selection.MONTHS, key=selection.KEY_TARGET_MONTH)
+        components.note(_reach_note(focus))
 
         components.spacer("md")
         components.panel_header("Display")
@@ -168,7 +173,9 @@ def rail(dataset: data.DashboardData) -> selection.Selection:
 
         components.spacer("lg")
         components.panel_header("Export")
-        current = selection.read(dataset.states, periods)
+        current = selection.read(
+            dataset.states, periods, data.default_target(dataset, focus)
+        )
         views.export_view(dataset, current)
 
         components.spacer("lg")
@@ -189,22 +196,50 @@ def rail(dataset: data.DashboardData) -> selection.Selection:
     return current
 
 
+def _reach_note(state: str) -> str:
+    """Name the three regimes before a month is chosen.
+
+    The picker reaches decades out, and most of that is answered by a different
+    and weaker method than the near months are. Saying so up front turns an
+    unfamiliar answer into an informed choice rather than a surprise.
+    """
+    verdict = data.target_verdict(state, pd.Timestamp.today().normalize().isoformat())
+    if verdict is None:
+        return "Ask about any month."
+    return (
+        f"Data ends <b>{verdict.last_observed.strftime('%b %Y')}</b>. Forecast "
+        f"model to <b>{verdict.furthest_forecastable.strftime('%b %Y')}</b>, "
+        f"seasonal profile to <b>{verdict.furthest_seasonal.strftime('%b %Y')}</b>, "
+        f"then typical-month climatology to "
+        f"<b>{verdict.furthest_climatology.strftime('%Y')}</b>."
+    )
+
+
+def _year_options(dataset: data.DashboardData, state: str) -> list[int]:
+    """Years the picker offers: the whole record, plus everything climatology reaches.
+
+    Deliberately far. Most of that range is answered by the typical-month profile
+    rather than by the forecast model, and the panel says which -- a question that
+    can be asked and answered honestly is worth more than a control that stops at
+    the forecast model's limit and implies nothing exists beyond it.
+    """
+    dates = pd.DatetimeIndex(dataset.panel.index.get_level_values("date"))
+    first, last = int(dates.min().year), int(dates.max().year)
+    del state
+    reach = int(data.config().seasonal.climatology_max_years)
+    return list(range(first, last + reach + 1))
+
+
 def _provenance(
     dataset: data.DashboardData, current: selection.Selection
 ) -> str:
     """One line naming what produced these numbers, and what they are about."""
-    line = (
+    return (
         f"Showing {current.period.strftime('%B %Y')} at the "
         f"{dataset.meta['interval_coverage']:.0%} interval upper bound. "
         f"Frozen model {dataset.meta['experiment']}, trained "
         f"{str(dataset.meta['trained_at'])[:10]}."
     )
-    if current.projecting:
-        line += (
-            f" Projecting {current.horizon} periods past the last observation; "
-            "steps beyond the trained horizon are recursive."
-        )
-    return line
 
 
 def _hint(error: Exception) -> str:

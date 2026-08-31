@@ -406,7 +406,9 @@ def _text_of(figure) -> str:
 def _selection(**overrides: object) -> selection.Selection:
     """A selection with sensible defaults, for the store's own tests."""
     fields: dict[str, object] = {
-        "state": "Kerala", "period": pd.Timestamp("2023-06-01"), "horizon": 0
+        "state": "Kerala",
+        "period": pd.Timestamp("2023-06-01"),
+        "target_date": pd.Timestamp("2024-01-01"),
     }
     fields.update(overrides)
     return selection.Selection(**fields)  # type: ignore[arg-type]
@@ -431,22 +433,28 @@ def test_overlay_puts_the_focus_first_and_never_twice() -> None:
 
 def test_cache_key_ignores_what_only_changes_the_drawing() -> None:
     """Uncertainty and comparison change the render, not the computation."""
-    plain = _selection(horizon=3)
-    decorated = _selection(horizon=3, show_uncertainty=False, compare=("Odisha",))
+    plain = _selection()
+    decorated = _selection(show_uncertainty=False, compare=("Odisha",))
     assert plain.key() == decorated.key()
 
 
 def test_cache_key_separates_what_does_change_the_computation() -> None:
-    assert _selection(horizon=3).key() != _selection(horizon=6).key()
+    assert (
+        _selection(target_date=pd.Timestamp("2024-01-01")).key()
+        != _selection(target_date=pd.Timestamp("2024-04-01")).key()
+    )
     assert _selection(state="Kerala").key() != _selection(state="Odisha").key()
 
 
-def test_horizon_modes_offer_no_number_past_the_configured_cap() -> None:
-    """The rail must not ask a question whose honest answer is a refusal."""
-    from src.config import load_config
+def test_the_picker_offers_months_the_model_cannot_reach() -> None:
+    """Deliberate. A refusal that explains itself teaches the model's limits.
 
-    cap = load_config().forecast.max_recursive_steps
-    assert max(selection.HORIZON_MODES.values()) <= cap
+    A greyed-out control that says nothing reads as a broken one, so the picker
+    accepts the question and :func:`~src.simulate.classify_target` answers with a
+    reason instead of a number.
+    """
+    assert selection.YEARS_BEYOND_REACH > 0
+    assert len(selection.MONTHS) == 12
 
 
 def test_advance_period_wraps_at_the_end(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -466,9 +474,12 @@ def test_read_falls_back_when_the_stored_state_is_gone(
     store: dict[str, object] = {selection.KEY_STATE: "Atlantis"}
     monkeypatch.setattr(selection.st, "session_state", store)
 
-    current = selection.read(["Kerala", "Odisha"], [pd.Timestamp("2023-01-01")])
+    current = selection.read(
+        ["Kerala", "Odisha"], [pd.Timestamp("2023-01-01")], pd.Timestamp("2024-01-01")
+    )
     assert current.state == "Kerala"
     assert current.period == pd.Timestamp("2023-01-01")
+    assert current.target_date == pd.Timestamp("2024-01-01")
 
 
 # --------------------------------------------------------------------------- #

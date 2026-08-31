@@ -82,6 +82,15 @@ TIER_INK: dict[str, str] = {"LOW": NEUTRAL[700], "MEDIUM": NEUTRAL[900], "HIGH":
 #: Prediction interval band. Soft, so the line reads first.
 BAND = "#DCE7EB"
 
+#: The seasonal profile's line and band.
+#:
+#: Drawn in muted ink rather than in a second accent colour. The accent means
+#: "this is the forecast model"; a climatological pattern is a different and
+#: weaker claim, and giving it equal visual weight would say otherwise. One
+#: accent, spent on one thing.
+SEASONAL_LINE = NEUTRAL[500]
+SEASONAL_BAND = NEUTRAL[200]
+
 #: Fill for a state carrying no forecast.
 #:
 #: Distinguished by hatching rather than by colour, which is the cartographic

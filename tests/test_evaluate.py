@@ -187,11 +187,16 @@ def test_every_baseline_satisfies_the_protocol(dataset, wide_cfg: Config) -> Non
 
 
 def test_the_readme_baseline_set_is_complete(dataset, wide_cfg: Config) -> None:
-    """README section 6 asks for naive, linear and gradient-boosting baselines."""
+    """README section 6 asks for naive, linear and gradient-boosting baselines.
+
+    Checked as a subset, not an equality: the set grows when a model earns its
+    place, and pinning it exactly turns every addition into an unrelated test
+    failure. What matters is that none of the four the README names goes missing.
+    """
     _, _, spec = dataset
-    assert set(baseline_factories(spec, wide_cfg)) == {
-        "persistence", "seasonal_naive", "gbm", "ridge",
-    }
+    assert {"persistence", "seasonal_naive", "gbm", "ridge"} <= set(
+        baseline_factories(spec, wide_cfg)
+    )
 
 
 def test_ridge_baseline_learns_something(dataset, wide_cfg: Config) -> None:
@@ -206,11 +211,12 @@ def test_ridge_baseline_learns_something(dataset, wide_cfg: Config) -> None:
 def test_one_harness_serves_every_baseline_unmodified(dataset, wide_cfg: Config) -> None:
     """The gate: the same call runs all of them without special-casing."""
     _, _, spec = dataset
+    factories = baseline_factories(spec, wide_cfg)
     results = [
         run_experiment(factory, dataset, wide_cfg, name)
-        for name, factory in baseline_factories(spec, wide_cfg).items()
+        for name, factory in factories.items()
     ]
-    assert len(results) == 4
+    assert len(results) == len(factories)
     for result in results:
         assert len(result.folds) == wide_cfg.split.n_folds
         assert np.isfinite(result.primary)
@@ -348,5 +354,5 @@ def test_compare_ranks_runs_by_the_headline_metric(dataset, wide_cfg: Config) ->
         for name, factory in baseline_factories(spec, wide_cfg).items()
     ]
     table = compare(results)
-    assert set(table.index) == {"persistence", "seasonal_naive", "gbm", "ridge"}
+    assert set(table.index) == {result.name for result in results}
     assert table["mae_cases_per_100k"].is_monotonic_increasing

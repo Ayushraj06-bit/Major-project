@@ -123,6 +123,37 @@ split:
   test_size: 12
   step: 12
 
+seasonal:
+  # The second forecaster: a per-state monthly profile anchored to the recent
+  # level. It does not compound its own error, so it can run far past the
+  # recursive cap -- at the cost of being unable to react to anything but level.
+  #
+  # Years of history the projector fits its profile on. The harness-measured
+  # variant trains on the whole fold, like every other model, because the
+  # Forecaster protocol supplies no dates to slice by.
+  trailing_years: 10
+  # Whether the profile is anchored to the state's recent level. With this off it
+  # is pure climatology: "an average September", ignoring how this year is going.
+  use_level_anchor: true
+  # Whether a long-run trend, fitted over trailing_years, is carried forward.
+  use_trend: true
+  # How fast that trend flattens as it is extrapolated. 1.0 runs a straight line
+  # forever, which at two years is a claim the data cannot support; 0.0 removes
+  # the trend and leaves the level anchor alone. At 0.9 the drift converges to
+  # about ten periods' worth however far out you ask, so a two-year projection
+  # bends rather than shooting off.
+  trend_damping: 0.9
+  # Furthest an *anchored and trended* projection runs past the last observation.
+  # Beyond this the level anchor is meaningless and the trend is extrapolation, so
+  # both are dropped and what remains is pure climatology.
+  max_projection_periods: 24
+  # How far ahead climatology will still answer. It answers a different question --
+  # "what does this month typically look like here?" -- which is as true of 2030
+  # as of next year, because it is a statement about Augusts and not about 2030.
+  # The limit exists because at some distance the assumption that the climate and
+  # reporting regime is unchanged stops being credible.
+  climatology_max_years: 25
+
 forecast:
   # brain.md C-3 / README §15.6: 1-month and 3-month lead time.
   horizons: [1, 3]
